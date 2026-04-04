@@ -72,7 +72,7 @@ pkg install -y termux-api 2>/dev/null || warn "termux-api not available — inst
 info "Installing Python dependencies (this may take a few minutes)…"
 
 PACKAGES=(
-    "python-telegram-bot==20.7"
+    "python-telegram-bot>=21.1.1"
     "requests==2.31.0"
     "Pillow==10.2.0"
     "qrcode[pil]==7.4.2"
@@ -120,14 +120,14 @@ mkdir -p data downloads qrcodes logs
 # ── Step 8: Termux:Boot auto-start ──────────────────────────────
 BOOT_DIR="$HOME/.termux/boot"
 mkdir -p "$BOOT_DIR"
-cat > "$BOOT_DIR/start_terabox_bot.sh" << 'BOOTSCRIPT'
+cat > "$BOOT_DIR/start_terabox_bot.sh" << BOOTSCRIPT
 #!/data/data/com.termux/files/usr/bin/bash
 # Wait for network
 sleep 15
 # Acquire wakelock
 termux-wake-lock 2>/dev/null || true
 # Start bot
-cd "$HOME/terabox_bot"
+cd "$BOT_DIR"
 bash run.sh >> logs/boot.log 2>&1 &
 BOOTSCRIPT
 chmod +x "$BOOT_DIR/start_terabox_bot.sh"
