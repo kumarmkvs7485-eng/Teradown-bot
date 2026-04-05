@@ -1,128 +1,99 @@
 #!/data/data/com.termux/files/usr/bin/bash
-# ═══════════════════════════════════════════════════════════════
-#   run.sh  —  Smart launcher with auto-restart & crash recovery
-# ═══════════════════════════════════════════════════════════════
+# Smart launcher with auto-restart, crash recovery, log rotation
 
 BOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$BOT_DIR"
 
-LOG_FILE="logs/bot.log"
-PID_FILE=".bot.pid"
-CRASH_COUNT_FILE=".crash_count"
-MAX_RESTARTS=10
-RESTART_DELAY=5     # seconds between restarts
-BACKOFF_MAX=120     # max delay after many crashes
+GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
+LOG="logs/bot.log"; PID_FILE=".bot.pid"; CRASH_FILE=".crashes"
+MAX_CRASHES=10; BASE_DELAY=5; MAX_DELAY=120
 
 mkdir -p logs
 
-# ── Colours ──────────────────────────────────────────────────────
-GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
-
-# ── Check .env ───────────────────────────────────────────────────
+# Check .env
 if [ ! -f ".env" ]; then
-    echo -e "${YELLOW}[!] .env not found — creating it now.${NC}"
     cat > .env << 'ENVEOF'
 BOT_TOKEN=YOUR_BOT_TOKEN_HERE
 ADMIN_IDS=123456789
 UPI_ID=yourname@paytm
 UPI_NAME=Your Name
 ENVEOF
-    echo -e "${RED}[✗] Please fill in .env before starting:${NC}"
-    echo "    nano .env"
+    echo -e "${RED}[✗] .env was missing — created now.${NC}"
+    echo "    Edit it:  nano .env"
     exit 1
 fi
 
 TOKEN=$(grep "^BOT_TOKEN=" .env | cut -d= -f2 | tr -d '[:space:]')
 if [ -z "$TOKEN" ] || [ "$TOKEN" = "YOUR_BOT_TOKEN_HERE" ]; then
-    echo -e "${RED}[✗] BOT_TOKEN is not set in .env!${NC}"
-    echo -e "    Run: ${YELLOW}nano .env${NC}  and fill in your bot token."
+    echo -e "${RED}[✗] BOT_TOKEN not set! Edit .env first:  nano .env${NC}"
     exit 1
 fi
 
-# ── Prevent duplicate instances ──────────────────────────────────
+# Kill existing instance
 if [ -f "$PID_FILE" ]; then
-    OLD_PID=$(cat "$PID_FILE")
-    if kill -0 "$OLD_PID" 2>/dev/null; then
-        echo -e "${YELLOW}[!] Bot already running (PID $OLD_PID). Use stop.sh first.${NC}"
+    OLD=$(cat "$PID_FILE")
+    if kill -0 "$OLD" 2>/dev/null; then
+        echo -e "${YELLOW}[!] Bot already running (PID $OLD). Stop with: bash stop.sh${NC}"
         exit 1
     fi
 fi
 
-# ── Wake lock ────────────────────────────────────────────────────
-termux-wake-lock 2>/dev/null || true
-
-# ── Memory optimiser for Vivo V9 (4GB) ──────────────────────────
-# Limit Python to use at most 512 MB
+# Memory settings for 4GB device
+export PYTHONOPTIMIZE=1
+export PYTHONDONTWRITEBYTECODE=1
 export PYTHONMALLOC=malloc
 export MALLOC_TRIM_THRESHOLD_=65536
-export PYTHONOPTIMIZE=1           # removes assert & __debug__ blocks
-export PYTHONDONTWRITEBYTECODE=1  # no .pyc files (saves storage)
 
-# ── Rotate logs > 5 MB ───────────────────────────────────────────
-if [ -f "$LOG_FILE" ] && [ $(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0) -gt 5242880 ]; then
-    mv "$LOG_FILE" "logs/bot_$(date +%Y%m%d_%H%M%S).log"
-    echo "$(date) — Log rotated" > "$LOG_FILE"
+# Wake lock
+termux-wake-lock 2>/dev/null || true
+
+# Log rotation
+if [ -f "$LOG" ] && [ "$(stat -c%s "$LOG" 2>/dev/null || echo 0)" -gt 5242880 ]; then
+    mv "$LOG" "logs/bot_$(date +%Y%m%d_%H%M).log"
 fi
 
-# ── Initialize crash counter ─────────────────────────────────────
-echo 0 > "$CRASH_COUNT_FILE"
-START_TIME=$(date +%s)
+echo 0 > "$CRASH_FILE"
+START_TS=$(date +%s)
 
-echo -e "${GREEN}[✓] Starting TeraBox Bot...${NC}"
-echo "    Logs → $LOG_FILE"
-echo "    Press Ctrl+C to stop"
-echo ""
+echo -e "${GREEN}[✓] Starting Downloader Hut Bot…${NC}"
+echo "    Logs: tail -f $LOG"
+echo "    Stop: bash stop.sh"
 
-# ── Main restart loop ────────────────────────────────────────────
 while true; do
-    CRASH_COUNT=$(cat "$CRASH_COUNT_FILE" 2>/dev/null || echo 0)
+    CRASHES=$(cat "$CRASH_FILE" 2>/dev/null || echo 0)
 
-    # Exponential back-off after many crashes
-    if [ "$CRASH_COUNT" -gt 3 ]; then
-        DELAY=$(( RESTART_DELAY * (2 ** (CRASH_COUNT - 3)) ))
-        DELAY=$(( DELAY > BACKOFF_MAX ? BACKOFF_MAX : DELAY ))
-        echo "$(date) — Crash #$CRASH_COUNT, waiting ${DELAY}s before restart…" | tee -a "$LOG_FILE"
+    if [ "$CRASHES" -ge "$MAX_CRASHES" ]; then
+        ELAPSED=$(( $(date +%s) - START_TS ))
+        if [ "$ELAPSED" -lt 300 ]; then
+            echo "$(date) — Too many crashes. Stopping." | tee -a "$LOG"
+            termux-notification --title "Bot STOPPED" --content "Too many crashes. Run: bash run.sh" 2>/dev/null || true
+            exit 1
+        fi
+        echo 0 > "$CRASH_FILE"; START_TS=$(date +%s)
+    fi
+
+    if [ "$CRASHES" -gt 2 ]; then
+        DELAY=$(( BASE_DELAY * (2 ** (CRASHES - 2)) ))
+        [ "$DELAY" -gt "$MAX_DELAY" ] && DELAY=$MAX_DELAY
+        echo "$(date) — Crash #$CRASHES, waiting ${DELAY}s…" >> "$LOG"
         sleep "$DELAY"
     fi
 
-    # Stop if too many crashes in a short time
-    if [ "$CRASH_COUNT" -ge "$MAX_RESTARTS" ]; then
-        ELAPSED=$(( $(date +%s) - START_TIME ))
-        if [ "$ELAPSED" -lt 300 ]; then   # 5 minutes
-            echo "$(date) — Too many crashes ($CRASH_COUNT) in ${ELAPSED}s. Stopping." | tee -a "$LOG_FILE"
-            termux-notification --title "TeraBox Bot STOPPED" \
-                --content "Too many crashes. Run: bash run.sh" 2>/dev/null || true
-            exit 1
-        fi
-        echo 0 > "$CRASH_COUNT_FILE"
-        START_TIME=$(date +%s)
-    fi
-
-    # Start bot
-    echo "$(date) — Starting bot (attempt $((CRASH_COUNT+1)))…" >> "$LOG_FILE"
-    python bot.py >> "$LOG_FILE" 2>&1 &
+    echo "$(date) — Starting (crash count: $CRASHES)" >> "$LOG"
+    python bot.py >> "$LOG" 2>&1 &
     BOT_PID=$!
     echo "$BOT_PID" > "$PID_FILE"
+    echo -e "${GREEN}[✓] Bot PID: $BOT_PID${NC}"
+    termux-notification --title "Bot Running ✅" --content "PID $BOT_PID" 2>/dev/null || true
 
-    echo -e "${GREEN}[✓] Bot started (PID $BOT_PID)${NC}"
-    termux-notification --title "TeraBox Bot ✅" \
-        --content "Bot is running (PID $BOT_PID)" 2>/dev/null || true
-
-    # Wait for process to exit
     wait "$BOT_PID"
-    EXIT_CODE=$?
-
+    CODE=$?
     rm -f "$PID_FILE"
 
-    if [ "$EXIT_CODE" -eq 0 ]; then
-        echo "$(date) — Bot exited cleanly (code 0). Stopping." | tee -a "$LOG_FILE"
-        break
-    fi
+    [ "$CODE" -eq 0 ] && { echo "$(date) — Clean exit." >> "$LOG"; break; }
 
-    echo "$(date) — Bot crashed (exit code $EXIT_CODE). Restarting in ${RESTART_DELAY}s…" | tee -a "$LOG_FILE"
-    termux-notification --title "TeraBox Bot ⚠️" \
-        --content "Bot crashed. Auto-restarting..." 2>/dev/null || true
-
-    echo $(( CRASH_COUNT + 1 )) > "$CRASH_COUNT_FILE"
-    sleep "$RESTART_DELAY"
+    echo "$(date) — Crashed (code $CODE). Restarting…" | tee -a "$LOG"
+    termux-notification --title "Bot Restarting ⚠️" --content "Crashed, auto-restarting..." 2>/dev/null || true
+    echo $(( CRASHES + 1 )) > "$CRASH_FILE"
+    sleep "$BASE_DELAY"
 done
