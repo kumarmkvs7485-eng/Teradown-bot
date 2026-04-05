@@ -1,241 +1,202 @@
 """
-payment.py  —  UPI payment verification + QR code generation
-               Termux-compatible with graceful OCR fallback
+payment.py — UPI payment verification + QR code generation
+Auto-approves genuine payments, flags suspicious ones for admin review.
 """
-import io
-import re
-import hashlib
-import logging
-from datetime import datetime
-
-import qrcode
-from PIL import Image, ImageDraw, ImageFont
+import io, re, hashlib, logging
+from PIL import Image, ImageDraw
 
 logger = logging.getLogger(__name__)
 
 try:
     import pytesseract
-    # On Termux, tesseract lives here
-    pytesseract.pytesseract.tesseract_cmd = "/data/data/com.termux/files/usr/bin/tesseract"
-    pytesseract.image_to_string(Image.new("RGB", (10, 10)))  # test call
+    pytesseract.pytesseract.tesseract_cmd = (
+        "/data/data/com.termux/files/usr/bin/tesseract"
+    )
+    pytesseract.image_to_string(Image.new("RGB", (10, 10)))
     OCR_AVAILABLE = True
-    logger.info("Tesseract OCR ready.")
+    logger.info("OCR: Tesseract ready")
 except Exception:
     OCR_AVAILABLE = False
-    logger.warning("Tesseract OCR not available — manual review mode active.")
+    logger.warning("OCR: Tesseract not available — using hash-only mode")
 
-# ─── QR Code Generation ───────────────────────────────────────────────────────
+try:
+    import qrcode
+    QR_AVAILABLE = True
+except ImportError:
+    QR_AVAILABLE = False
+    logger.warning("qrcode not installed")
+
+# ── QR Code ───────────────────────────────────────────────────────────────────
 def generate_upi_qr(upi_id: str, name: str, amount: float,
                     plan_name: str, save_path: str) -> str:
+    if not QR_AVAILABLE:
+        # Fallback: blank white image with text
+        img = Image.new("RGB", (300, 300), "white")
+        draw = ImageDraw.Draw(img)
+        draw.text((20, 120), f"Pay ₹{amount:.0f}", fill="black")
+        draw.text((20, 150), f"UPI: {upi_id}", fill="black")
+        img.save(save_path)
+        return save_path
+
     upi_uri = (
-        f"upi://pay?pa={upi_id}&pn={name.replace(' ', '%20')}"
+        f"upi://pay?pa={upi_id}"
+        f"&pn={name.replace(' ', '%20')}"
         f"&am={amount:.2f}&cu=INR"
         f"&tn={plan_name.replace(' ', '%20')}"
     )
-
-    qr = qrcode.QRCode(
-        version=3,
-        error_correction=qrcode.constants.ERROR_CORRECT_H,
-        box_size=10,
-        border=4,
-    )
+    qr = qrcode.QRCode(version=3,
+                        error_correction=qrcode.constants.ERROR_CORRECT_H,
+                        box_size=9, border=3)
     qr.add_data(upi_uri)
     qr.make(fit=True)
-
-    img = qr.make_image(fill_color="#0d1b2a", back_color="#ffffff").convert("RGBA")
+    img = qr.make_image(fill_color="#0d1b2a", back_color="white").convert("RGB")
     w, h = img.size
 
-    # Add label bar at bottom
-    bar_height = 50
-    final = Image.new("RGBA", (w, h + bar_height), "#ffffff")
-    final.paste(img, (0, 0))
-
-    draw = ImageDraw.Draw(final)
-    draw.rectangle([(0, h), (w, h + bar_height)], fill="#0d1b2a")
-
-    label = f"Pay ₹{amount:.0f}  |  {upi_id}"
-    # Use default font (no extra font needed on Termux)
-    draw.text((w // 2, h + bar_height // 2), label,
+    # Label bar
+    canvas = Image.new("RGB", (w, h + 45), "#0d1b2a")
+    canvas.paste(img, (0, 0))
+    draw = ImageDraw.Draw(canvas)
+    draw.text((w // 2, h + 22), f"Pay ₹{amount:.0f}  |  {upi_id}",
               fill="white", anchor="mm")
-
-    final.save(save_path)
-    logger.info(f"QR saved: {save_path}")
+    canvas.save(save_path)
     return save_path
 
-# ─── Screenshot Hash ──────────────────────────────────────────────────────────
-def hash_screenshot(image_bytes: bytes) -> str:
-    return hashlib.sha256(image_bytes).hexdigest()
+# ── Screenshot hash ───────────────────────────────────────────────────────────
+def hash_screenshot(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
-# ─── OCR Extraction ───────────────────────────────────────────────────────────
-_TXN_PATTERNS = [
-    r"(?i)(?:utr|ref(?:erence)?|txn|transaction)[^\w]*([A-Z0-9]{8,25})",
-    r"\b([A-Z]{2,4}[0-9]{8,20})\b",
+# ── OCR Patterns ─────────────────────────────────────────────────────────────
+_TXN = [
+    r"(?i)(?:utr|ref(?:erence)?|txn|transaction\s*id)[^\w]*([A-Z0-9]{8,25})",
+    r"\b([A-Z]{2,5}[0-9]{8,18})\b",
     r"\b(\d{12,16})\b",
 ]
-_AMOUNT_PATTERNS = [
-    r"(?i)(?:rs\.?|inr|₹)\s*(\d+(?:[.,]\d{1,2})?)",
-    r"(\d+(?:[.,]\d{1,2})?)\s*(?:rs\.?|inr|₹)",
-    r"(?i)(?:paid|amount|total)[^\d]*(\d+(?:[.,]\d{1,2})?)",
+_AMT = [
+    r"(?i)(?:rs\.?|inr|₹)\s*(\d[\d,]*(?:\.\d{1,2})?)",
+    r"(\d[\d,]*(?:\.\d{1,2})?)\s*(?:rs\.?|inr|₹)",
+    r"(?i)(?:paid|amount|total)[^\d]{0,10}(\d[\d,]*(?:\.\d{1,2})?)",
 ]
-_DATE_PATTERNS = [
+_DT  = [
     r"\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b",
-    r"\b(\d{4}[/-]\d{1,2}[/-]\d{1,2})\b",
-    r"(?i)(\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d{2,4})",
+    r"(?i)(\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d{4})",
     r"(?i)((?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d{1,2},?\s+\d{4})",
+    r"\b(\d{4}-\d{2}-\d{2})\b",
 ]
-FAKE_KEYWORDS = [
-    "cancelled", "cancel", "failed", "decline", "declined",
-    "reversed", "refunded", "insufficient", "error", "invalid",
-    "test payment", "demo", "sample", "fake", "simulation",
-    "pending approval",
-]
-SUCCESS_KEYWORDS = [
-    "success", "successful", "completed", "approved",
-    "paid", "credited", "received", "payment done",
-    "payment successful", "transaction successful",
-]
+BAD  = ["cancelled","cancel","failed","failure","declined","decline",
+        "reversed","refunded","insufficient","error","invalid",
+        "test payment","demo","sample","fake",]
+GOOD = ["success","successful","completed","approved","paid","credited",
+        "received","payment done","payment successful","debited","debit",]
 
-def extract_payment_info(image_bytes: bytes) -> dict:
-    result = {
-        "transaction_id": None,
-        "amount": None,
-        "date_str": None,
-        "raw_text": "",
-        "confidence": "low",
-        "suspicious_flags": [],
-        "success_signals": [],
-    }
-
+def _ocr_extract(image_bytes: bytes) -> dict:
+    r = {"txn": None, "amount": None, "date": None,
+         "raw": "", "bad_words": [], "good_words": [], "score": 0}
     if not OCR_AVAILABLE:
-        result["suspicious_flags"].append("ocr_unavailable")
-        return result
-
+        return r
     try:
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        # Upscale for better OCR on mobile screenshots
-        scale = 2
-        img = img.resize((img.width * scale, img.height * scale), Image.LANCZOS)
-        raw = pytesseract.image_to_string(img, lang="eng", config="--psm 6")
-        result["raw_text"] = raw
+        img = img.resize((img.width * 2, img.height * 2), Image.LANCZOS)
+        raw = pytesseract.image_to_string(img, config="--psm 6")
+        r["raw"] = raw
     except Exception as e:
         logger.error(f"OCR error: {e}")
-        result["suspicious_flags"].append("ocr_error")
-        return result
+        return r
 
-    text_low = raw.lower()
+    low = raw.lower()
+    r["bad_words"]  = [w for w in BAD  if w in low]
+    r["good_words"] = [w for w in GOOD if w in low]
 
-    for w in FAKE_KEYWORDS:
-        if w in text_low:
-            result["suspicious_flags"].append(f"bad_keyword:{w}")
-
-    for w in SUCCESS_KEYWORDS:
-        if w in text_low:
-            result["success_signals"].append(w)
-
-    for pat in _TXN_PATTERNS:
-        m = re.search(pat, raw, re.IGNORECASE)
+    for p in _TXN:
+        m = re.search(p, raw, re.I)
         if m:
-            result["transaction_id"] = m.group(1).upper().strip()
+            r["txn"] = m.group(1).upper().strip()
             break
 
-    for pat in _AMOUNT_PATTERNS:
-        m = re.search(pat, raw, re.IGNORECASE)
+    for p in _AMT:
+        m = re.search(p, raw, re.I)
         if m:
             try:
-                result["amount"] = float(m.group(1).replace(",", ""))
+                r["amount"] = float(m.group(1).replace(",", ""))
             except ValueError:
                 pass
             break
 
-    for pat in _DATE_PATTERNS:
-        m = re.search(pat, raw, re.IGNORECASE)
+    for p in _DT:
+        m = re.search(p, raw, re.I)
         if m:
-            result["date_str"] = m.group(0)
+            r["date"] = m.group(0)
             break
 
-    if not result["date_str"]:
-        result["suspicious_flags"].append("no_date")
+    s = 0
+    if r["txn"]:          s += 3
+    if r["amount"]:        s += 2
+    if r["date"]:          s += 1
+    if r["good_words"]:    s += 2
+    if not r["bad_words"]: s += 1
+    r["score"] = s
+    return r
 
-    # Confidence
-    score = 0
-    if result["transaction_id"]:  score += 3
-    if result["amount"]:           score += 2
-    if result["date_str"]:         score += 1
-    if result["success_signals"]:  score += 2
-    if not result["suspicious_flags"]: score += 1
-
-    result["confidence"] = "high" if score >= 6 else "medium" if score >= 3 else "low"
-    return result
-
-# ─── Full Verification Pipeline ───────────────────────────────────────────────
+# ── Main verification ─────────────────────────────────────────────────────────
 def verify_payment(image_bytes: bytes, expected_amount: float,
-                   screenshot_hash: str, hash_exists: bool) -> dict:
+                   screenshot_hash: str, hash_exists: bool,
+                   mode: str = "auto") -> dict:
+    """
+    Returns:
+      approved bool, reason str, transaction_id str|None,
+      needs_manual_review bool, suspicious bool, ocr dict
+    """
+    def _r(approved, reason, txn=None, manual=False, suspicious=False, ocr=None):
+        return {
+            "approved": approved, "reason": reason,
+            "transaction_id": txn, "needs_manual_review": manual,
+            "suspicious": suspicious, "ocr_info": ocr or {},
+        }
+
+    # Duplicate screenshot
     if hash_exists:
-        return {
-            "approved": False,
-            "reason": "duplicate_screenshot",
-            "transaction_id": None,
-            "ocr_info": {},
-            "needs_manual_review": True,
-        }
+        return _r(False, "duplicate_screenshot", suspicious=True, manual=True)
 
-    ocr = extract_payment_info(image_bytes)
+    ocr = _ocr_extract(image_bytes)
 
-    bad_keywords = [f for f in ocr["suspicious_flags"] if f.startswith("bad_keyword:")]
-    if bad_keywords:
-        return {
-            "approved": False,
-            "reason": f"suspicious_content ({', '.join(bad_keywords)})",
-            "transaction_id": None,
-            "ocr_info": ocr,
-            "needs_manual_review": True,
-        }
+    # Fake/failed keywords
+    if ocr["bad_words"]:
+        return _r(False, f"fake_screenshot ({', '.join(ocr['bad_words'])})",
+                  suspicious=True, manual=True, ocr=ocr)
 
+    # Amount mismatch (only if OCR found an amount)
     if ocr["amount"] is not None and expected_amount > 0:
-        if abs(ocr["amount"] - expected_amount) > 1.0:
-            return {
-                "approved": False,
-                "reason": f"amount_mismatch (found ₹{ocr['amount']:.0f}, expected ₹{expected_amount:.0f})",
-                "transaction_id": ocr["transaction_id"],
-                "ocr_info": ocr,
-                "needs_manual_review": True,
-            }
+        diff = abs(ocr["amount"] - expected_amount)
+        if diff > 1.5:
+            return _r(False,
+                      f"amount_mismatch (found ₹{ocr['amount']:.0f}, expected ₹{expected_amount:.0f})",
+                      txn=ocr["txn"], manual=True, suspicious=diff > 5, ocr=ocr)
 
-    # If OCR unavailable → queue for manual review but don't block
+    auto_txn = ocr["txn"] or f"AUTO_{screenshot_hash[:12].upper()}"
+
+    # Manual mode — never auto approve
+    if mode == "manual":
+        return _r(False, "manual_review_required", txn=auto_txn, manual=True, ocr=ocr)
+
+    # OCR unavailable — approve with manual review flag
     if not OCR_AVAILABLE:
-        auto_txn = f"MANUAL_{screenshot_hash[:10].upper()}"
-        return {
-            "approved": True,
-            "reason": "ocr_unavailable_manual_review",
-            "transaction_id": auto_txn,
-            "ocr_info": ocr,
-            "needs_manual_review": True,
-        }
+        return _r(True, "ocr_unavailable_auto_approved",
+                  txn=auto_txn, manual=True, ocr=ocr)
 
-    if ocr["confidence"] == "low":
-        return {
-            "approved": False,
-            "reason": "low_confidence_screenshot",
-            "transaction_id": ocr["transaction_id"],
-            "ocr_info": ocr,
-            "needs_manual_review": True,
-        }
+    # Strict mode — only approve high confidence
+    if mode == "strict" and ocr["score"] < 6:
+        return _r(False, "strict_mode_low_confidence",
+                  txn=auto_txn, manual=True, ocr=ocr)
 
-    txn = ocr["transaction_id"] or f"AUTO_{screenshot_hash[:10].upper()}"
+    # Auto mode
+    if ocr["score"] >= 5:
+        return _r(True, "auto_approved_high_confidence",
+                  txn=auto_txn, manual=False, ocr=ocr)
 
-    if ocr["confidence"] == "medium":
-        return {
-            "approved": True,
-            "reason": "medium_confidence_auto_approved",
-            "transaction_id": txn,
-            "ocr_info": ocr,
-            "needs_manual_review": True,
-        }
+    if ocr["score"] >= 3:
+        # Approve but flag for admin
+        return _r(True, "auto_approved_medium_confidence",
+                  txn=auto_txn, manual=True, ocr=ocr)
 
-    return {
-        "approved": True,
-        "reason": "auto_verified_high_confidence",
-        "transaction_id": txn,
-        "ocr_info": ocr,
-        "needs_manual_review": False,
-    }
+    # Low confidence — ask for better screenshot, don't flag as suspicious
+    return _r(False, "low_confidence_screenshot",
+              txn=auto_txn, manual=False, ocr=ocr)
