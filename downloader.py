@@ -1,10 +1,10 @@
 """
 downloader.py — TeraBox Video Downloader
-5 fallback methods, session-based scraping, works on Termux ARM
+Robust 6-method pipeline with full debug logging.
 """
-import os, re, time, gzip, json, shutil, logging, subprocess, hashlib
+import os, re, time, gzip, json, shutil, logging, subprocess
 import requests
-from urllib.parse import urlparse, parse_qs, quote, urlencode
+from urllib.parse import urlparse, parse_qs, quote
 from config import DOWNLOADS_DIR, MAX_FILE_SIZE_MB, CHUNK_SIZE_KB, DOWNLOAD_RETRIES
 
 logger = logging.getLogger(__name__)
@@ -12,533 +12,487 @@ logger = logging.getLogger(__name__)
 MAX_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 CHUNK     = CHUNK_SIZE_KB * 1024
 
-# ── Shared HTTP session ───────────────────────────────────────────────────────
+# ── Shared session ────────────────────────────────────────────────────────────
 S = requests.Session()
 S.headers.update({
     "User-Agent": (
-        "Mozilla/5.0 (Linux; Android 9; Vivo V9) "
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Mobile Safari/537.36"
+        "Chrome/124.0.0.0 Safari/537.36"
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
     "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
 })
-S.mount("https://", requests.adapters.HTTPAdapter(
-    max_retries=requests.adapters.Retry(total=3, backoff_factor=1,
-    status_forcelist=[429, 500, 502, 503, 504])
-))
-S.mount("http://", requests.adapters.HTTPAdapter(
-    max_retries=requests.adapters.Retry(total=3, backoff_factor=1)
-))
+_retry = requests.adapters.Retry(
+    total=3, backoff_factor=1.5,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET","POST"],
+)
+S.mount("https://", requests.adapters.HTTPAdapter(max_retries=_retry))
+S.mount("http://",  requests.adapters.HTTPAdapter(max_retries=_retry))
 
-# ── TeraBox domains ───────────────────────────────────────────────────────────
+# ── Domains ───────────────────────────────────────────────────────────────────
 TB_DOMAINS = {
     "terabox.com", "1024terabox.com", "teraboxapp.com",
     "4funbox.com", "mirrorbox.com", "momerybox.com",
     "nephobox.com", "freeterabox.com", "terabox.fun",
     "tibibox.com", "teraboxlink.com", "1024tera.com",
-    "terafileshare.com", "terasharelink.com",
+    "terafileshare.com", "terasharelink.com", "teraboxvideo.com",
 }
 
 def is_terabox_url(text: str) -> str | None:
     text = text.strip()
-    m = re.search(r"https?://[^\s\"'<>\]]+", text)
+    m = re.search(r"https?://[^\s\"'<>\]\)]+", text)
     if m:
-        text = m.group(0).rstrip(")")
+        text = m.group(0)
     parsed = urlparse(text)
     host = parsed.netloc.lower().lstrip("www.")
-    if any(host == d or host.endswith("." + d) for d in TB_DOMAINS):
+    if any(host == d or host.endswith("."+d) for d in TB_DOMAINS):
         return text
     return None
 
+# ── Extract surl from any TeraBox URL ─────────────────────────────────────────
 def _surl(url: str) -> str | None:
     parsed = urlparse(url)
     qs = parse_qs(parsed.query)
     if "surl" in qs:
         return qs["surl"][0]
-    m = re.search(r"/s/([A-Za-z0-9_-]+)", parsed.path)
+    m = re.search(r"/s/([A-Za-z0-9_\-]+)", parsed.path)
     return m.group(1) if m else None
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  METHOD 1: yt-dlp  (most reliable)
+#  DEBUG INFO — returned with every attempt for admin /debug command
 # ─────────────────────────────────────────────────────────────────────────────
-def _ytdlp_ok() -> bool:
-    try:
-        r = subprocess.run(["yt-dlp", "--version"],
-                           capture_output=True, timeout=5)
-        return r.returncode == 0
-    except Exception:
-        return False
+class DebugLog:
+    def __init__(self):
+        self.steps: list[str] = []
+    def add(self, msg: str):
+        logger.info(msg)
+        self.steps.append(msg)
+    def err(self, msg: str):
+        logger.warning(msg)
+        self.steps.append(f"✗ {msg}")
+    def ok(self, msg: str):
+        logger.info(msg)
+        self.steps.append(f"✓ {msg}")
+    def summary(self) -> str:
+        return "\n".join(self.steps[-30:])  # last 30 lines
 
-def _dl_ytdlp(url: str, out: str, prog=None) -> bool:
-    if not _ytdlp_ok():
+# ─────────────────────────────────────────────────────────────────────────────
+#  METHOD 1: yt-dlp  (direct download — most reliable when installed)
+# ─────────────────────────────────────────────────────────────────────────────
+def _ytdlp_bin() -> str | None:
+    for cmd in ("yt-dlp", f"{os.environ.get('HOME','')}/bin/yt-dlp",
+                "/data/data/com.termux/files/usr/bin/yt-dlp"):
+        try:
+            r = subprocess.run([cmd, "--version"], capture_output=True, timeout=5)
+            if r.returncode == 0:
+                return cmd
+        except Exception:
+            pass
+    return None
+
+def _m1_ytdlp_direct(url: str, out: str, dbg: DebugLog, prog=None) -> bool:
+    bin_ = _ytdlp_bin()
+    if not bin_:
+        dbg.err("M1: yt-dlp not found in PATH")
         return False
-    base = out.rsplit(".", 1)[0] if "." in os.path.basename(out) else out
+    ver = subprocess.run([bin_,"--version"],capture_output=True,text=True).stdout.strip()
+    dbg.add(f"M1: yt-dlp {ver}")
+    base = out.rsplit(".",1)[0] if "." in os.path.basename(out) else out
     tmpl = base + ".%(ext)s"
     cmd  = [
-        "yt-dlp",
-        "--no-playlist", "--no-warnings", "--quiet",
+        bin_,
+        "--no-playlist", "--no-warnings",
         "--merge-output-format", "mp4",
         "--output", tmpl,
         "--max-filesize", f"{MAX_FILE_SIZE_MB}m",
-        "--retries", "4",
-        "--fragment-retries", "4",
+        "--retries", "5",
+        "--fragment-retries", "5",
         "--socket-timeout", "30",
-        "--user-agent",
-        "Mozilla/5.0 (Android 9; Mobile) Chrome/124.0",
+        "--extractor-retries", "3",
+        "--user-agent", S.headers["User-Agent"],
         url,
     ]
+    dbg.add(f"M1: running yt-dlp…")
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        dbg.add(f"M1: exit={proc.returncode}")
+        if proc.stderr:
+            dbg.add(f"M1 stderr: {proc.stderr[:300]}")
         if proc.returncode == 0:
-            for ext in ("mp4", "mkv", "webm", "m4v", "avi"):
+            for ext in ("mp4","mkv","webm","m4v","avi"):
                 c = base + "." + ext
                 if os.path.exists(c) and os.path.getsize(c) > 1000:
                     if c != out:
                         shutil.move(c, out)
-                    if prog:
-                        prog(100, os.path.getsize(out), os.path.getsize(out))
+                    sz = os.path.getsize(out)
+                    dbg.ok(f"M1: downloaded {format_size(sz)}")
+                    if prog: prog(100, sz, sz)
                     return True
-        logger.debug(f"yt-dlp stderr: {proc.stderr[:300]}")
+        dbg.err(f"M1: no output file found after yt-dlp")
     except subprocess.TimeoutExpired:
-        logger.warning("yt-dlp timed out")
+        dbg.err("M1: yt-dlp timed out (300s)")
     except Exception as e:
-        logger.debug(f"yt-dlp exception: {e}")
+        dbg.err(f"M1 exception: {e}")
     return False
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  METHOD 2: TeraBox session scraper  (proper cookie-based API)
+#  METHOD 2: Page scrape — extract locals.mset / window.__data
 # ─────────────────────────────────────────────────────────────────────────────
-def _scrape_terabox(url: str) -> dict | None:
+def _m2_page_scrape(url: str, dbg: DebugLog) -> dict | None:
     """
-    Proper TeraBox share-link scraper:
-    1. Visit share page → get cookies + tokens
-    2. Call shorturlinfo API → get file metadata
-    3. Call download API → get direct link
+    TeraBox embeds file metadata in page JS as:
+      locals.mset({...})  OR  window.__initialState = {...}  OR  renderContent({...})
+    Extract that and build download URL directly.
     """
-    surl = _surl(url)
-    if not surl:
-        logger.debug("No surl extracted")
+    dbg.add(f"M2: fetching share page: {url}")
+    try:
+        r = S.get(url, timeout=25, allow_redirects=True)
+        dbg.add(f"M2: page status={r.status_code} final_url={r.url[:80]}")
+        if r.status_code != 200:
+            dbg.err(f"M2: bad status {r.status_code}")
+            return None
+    except Exception as e:
+        dbg.err(f"M2: page fetch failed: {e}")
         return None
 
-    # Step 1: Visit the share page to get session cookies
-    share_url = f"https://www.terabox.com/sharing/link?surl={surl}"
-    try:
-        r0 = S.get(share_url, timeout=20, allow_redirects=True)
-        # Extract jsToken from page HTML
-        js_token = ""
-        m = re.search(r'window\.jsToken\s*=\s*["\']([^"\']+)', r0.text)
-        if m:
-            js_token = m.group(1)
-        # Also try to get logid
-        logid = ""
-        m2 = re.search(r'fn\("([a-f0-9]+)"\)', r0.text)
-        if m2:
-            logid = m2.group(1)
-    except Exception as e:
-        logger.debug(f"Share page fetch failed: {e}")
-        js_token = ""
+    html   = r.text
+    S.cookies.update(r.cookies)  # save cookies for API calls
 
-    # Step 2: Try multiple API domains
-    apis = [
-        "https://www.terabox.com",
-        "https://www.1024terabox.com",
-        "https://terabox.com",
-    ]
-
-    for base_api in apis:
+    # Pattern 1: locals.mset({...}) — classic TeraBox
+    m = re.search(r'locals\.mset\s*\(\s*(\{.+?\})\s*\)', html, re.DOTALL)
+    if m:
         try:
-            params = {
-                "app_id": "250528",
-                "shorturl": surl,
-                "root": "1",
-            }
-            if js_token:
-                params["jsToken"] = js_token
+            data  = json.loads(m.group(1))
+            result = _parse_locals_mset(data, dbg)
+            if result:
+                return result
+        except Exception as e:
+            dbg.err(f"M2: locals.mset parse error: {e}")
 
+    # Pattern 2: __initialState
+    m = re.search(r'window\.__initialState\s*=\s*(\{.+?\});', html, re.DOTALL)
+    if m:
+        try:
+            data   = json.loads(m.group(1))
+            result = _parse_initial_state(data, dbg)
+            if result:
+                return result
+        except Exception as e:
+            dbg.err(f"M2: __initialState parse error: {e}")
+
+    # Pattern 3: renderContent or pageData
+    for pat in [
+        r'"list"\s*:\s*(\[.+?\])',
+        r'"fileList"\s*:\s*(\[.+?\])',
+    ]:
+        m = re.search(pat, html, re.DOTALL)
+        if m:
+            try:
+                fl = json.loads(m.group(1))
+                if fl:
+                    fi = fl[0]
+                    uk     = re.search(r'"uk"\s*:\s*"?(\d+)"?', html)
+                    sid    = re.search(r'"shareid"\s*:\s*"?(\d+)"?', html)
+                    sign   = re.search(r'"sign"\s*:\s*"([^"]+)"', html)
+                    ts     = re.search(r'"timestamp"\s*:\s*"?(\d+)"?', html)
+                    fs_id  = fi.get("fs_id") or fi.get("fsid")
+                    fname  = fi.get("server_filename","video.mp4")
+                    fsize  = fi.get("size", 0)
+                    if fs_id and uk and sid and sign:
+                        dbg.ok(f"M2: found via pattern fileList: {fname}")
+                        return {
+                            "fs_id": str(fs_id),
+                            "filename": fname, "size": fsize,
+                            "uk": uk.group(1), "shareid": sid.group(1),
+                            "sign": sign.group(1),
+                            "timestamp": ts.group(1) if ts else str(int(time.time())),
+                            "page_url": r.url,
+                        }
+            except Exception as e:
+                dbg.err(f"M2: fileList pattern error: {e}")
+
+    # Pattern 4: Extract from meta/og tags for filename at least
+    title_m = re.search(r'<title>([^<]+)</title>', html)
+    if title_m:
+        dbg.add(f"M2: page title: {title_m.group(1)[:80]}")
+
+    dbg.err(f"M2: could not extract file data from page HTML (len={len(html)})")
+    # Save snippet for debug
+    dbg.add(f"M2 HTML snippet: {html[200:600]}")
+    return None
+
+def _parse_locals_mset(data: dict, dbg: DebugLog) -> dict | None:
+    share = data.get("share") or data
+    fl    = share.get("list") or share.get("fileList") or []
+    if not fl:
+        dbg.err("M2: locals.mset: empty list")
+        return None
+    fi     = fl[0]
+    fs_id  = str(fi.get("fs_id") or fi.get("fsid",""))
+    fname  = fi.get("server_filename","video.mp4")
+    fsize  = fi.get("size",0)
+    uk     = str(share.get("uk",""))
+    sid    = str(share.get("shareid",""))
+    sign   = share.get("sign","")
+    ts     = str(share.get("timestamp",int(time.time())))
+    if not fs_id or not uk:
+        dbg.err(f"M2: missing fs_id={fs_id} uk={uk}")
+        return None
+    dbg.ok(f"M2: locals.mset → {fname} ({format_size(fsize)})")
+    return {"fs_id":fs_id,"filename":fname,"size":fsize,
+            "uk":uk,"shareid":sid,"sign":sign,"timestamp":ts}
+
+def _parse_initial_state(data: dict, dbg: DebugLog) -> dict | None:
+    try:
+        share = (data.get("share") or data.get("shareInfo") or
+                 data.get("props",{}).get("pageProps",{}).get("share",{}))
+        fl    = share.get("list") or share.get("fileList") or []
+        if not fl:
+            dbg.err("M2: __initialState: empty list")
+            return None
+        fi    = fl[0]
+        fs_id = str(fi.get("fs_id") or fi.get("fsid",""))
+        fname = fi.get("server_filename","video.mp4")
+        fsize = fi.get("size",0)
+        uk    = str(share.get("uk",""))
+        sid   = str(share.get("shareid",""))
+        sign  = share.get("sign","")
+        ts    = str(share.get("timestamp",int(time.time())))
+        if not fs_id:
+            return None
+        dbg.ok(f"M2: __initialState → {fname}")
+        return {"fs_id":fs_id,"filename":fname,"size":fsize,
+                "uk":uk,"shareid":sid,"sign":sign,"timestamp":ts}
+    except Exception as e:
+        dbg.err(f"M2: __initialState parse: {e}")
+    return None
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  METHOD 3: TeraBox official API (with cookies from M2)
+# ─────────────────────────────────────────────────────────────────────────────
+def _m3_official_api(url: str, dbg: DebugLog) -> dict | None:
+    surl = _surl(url)
+    if not surl:
+        dbg.err("M3: no surl"); return None
+    dbg.add(f"M3: official API, surl={surl}")
+
+    # First visit page to get cookies
+    for domain in ("www.terabox.com","www.1024terabox.com","www.1024tera.com"):
+        share_page = f"https://{domain}/sharing/link?surl={surl}"
+        try:
+            p = S.get(share_page, timeout=20, allow_redirects=True)
+            dbg.add(f"M3: page {domain} → {p.status_code}")
+            S.cookies.update(p.cookies)
+        except Exception as e:
+            dbg.add(f"M3: page fetch {domain} failed: {e}")
+
+    for api_base in ("https://www.terabox.com","https://www.1024terabox.com","https://www.1024tera.com"):
+        try:
+            dbg.add(f"M3: shorturlinfo @ {api_base}")
             r1 = S.get(
-                f"{base_api}/api/shorturlinfo",
-                params=params,
-                headers={
-                    "Referer": share_url,
-                    "X-Requested-With": "XMLHttpRequest",
-                },
+                f"{api_base}/api/shorturlinfo",
+                params={"app_id":"250528","shorturl":surl,"root":"1"},
+                headers={"Referer": f"{api_base}/sharing/link?surl={surl}"},
                 timeout=20,
             )
+            dbg.add(f"M3: status={r1.status_code}")
             d1 = r1.json()
-            logger.debug(f"shorturlinfo ({base_api}): errno={d1.get('errno')}")
+            dbg.add(f"M3: errno={d1.get('errno')} errmsg={d1.get('errmsg','')}")
 
             if d1.get("errno") != 0:
                 continue
 
-            file_list = d1.get("list", [])
-            if not file_list:
-                continue
+            fl = d1.get("list",[])
+            if not fl: continue
 
-            fi    = file_list[0]
-            fs_id = str(fi.get("fs_id", ""))
-            fname = fi.get("server_filename", "video.mp4")
-            fsize = fi.get("size", 0)
-            uk    = str(d1.get("uk", ""))
-            sid   = str(d1.get("shareid", ""))
-            sign  = d1.get("sign", "")
-            ts    = str(d1.get("timestamp", int(time.time())))
+            fi    = fl[0]
+            fs_id = str(fi.get("fs_id",""))
+            fname = fi.get("server_filename","video.mp4")
+            fsize = fi.get("size",0)
+            uk    = str(d1.get("uk",""))
+            sid   = str(d1.get("shareid",""))
+            sign  = d1.get("sign","")
+            ts    = str(d1.get("timestamp",int(time.time())))
 
             if not fs_id:
-                continue
+                dbg.err(f"M3: no fs_id"); continue
 
-            # Step 3: Get download link
-            dl_params = {
-                "app_id": "250528",
-                "sign": sign,
-                "timestamp": ts,
-                "shareid": sid,
-                "uk": uk,
-                "product": "share",
-                "nozip": "1",
-                "fid_list": f"[{fs_id}]",
-            }
+            # Get download link
             r2 = S.get(
-                f"{base_api}/api/download",
-                params=dl_params,
-                headers={"Referer": share_url},
+                f"{api_base}/api/download",
+                params={
+                    "app_id":"250528","sign":sign,"timestamp":ts,
+                    "shareid":sid,"uk":uk,"product":"share",
+                    "nozip":"1","fid_list":f"[{fs_id}]",
+                },
+                headers={"Referer": f"{api_base}/sharing/link?surl={surl}"},
                 timeout=20,
             )
             d2 = r2.json()
-            logger.debug(f"download api: errno={d2.get('errno')}")
+            dbg.add(f"M3: download errno={d2.get('errno')}")
 
             if d2.get("errno") != 0:
+                dbg.err(f"M3: download API errno={d2.get('errno')} errmsg={d2.get('errmsg','')}")
                 continue
 
-            dlinks = d2.get("dlink", [])
+            dlinks = d2.get("dlink",[])
             if not dlinks:
-                continue
+                dbg.err("M3: empty dlink"); continue
 
-            dlink = dlinks[0].get("dlink", "")
+            dlink = dlinks[0].get("dlink","")
             if not dlink:
-                continue
+                dbg.err("M3: empty dlink url"); continue
 
-            logger.info(f"TeraBox API resolved: {fname} ({format_size(fsize)})")
-            return {"filename": fname, "url": dlink, "size": fsize,
-                    "referer": share_url}
+            dbg.ok(f"M3: got download link for {fname} ({format_size(fsize)})")
+            return {"filename":fname,"url":dlink,"size":fsize,
+                    "referer": f"{api_base}/sharing/link?surl={surl}"}
 
         except Exception as e:
-            logger.debug(f"TeraBox API {base_api} failed: {e}")
-            continue
+            dbg.err(f"M3: {api_base} exception: {e}")
 
     return None
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  METHOD 3: 1024tera.com API (alternate endpoint)
+#  METHOD 4: M2 page data → build download URL
 # ─────────────────────────────────────────────────────────────────────────────
-def _api_1024tera(url: str) -> dict | None:
-    surl = _surl(url)
-    if not surl:
+def _m4_page_then_api(url: str, dbg: DebugLog) -> dict | None:
+    """Use page-scraped metadata to hit the download API."""
+    page_data = _m2_page_scrape(url, dbg)
+    if not page_data:
         return None
-    try:
-        # 1024tera uses a slightly different API path
-        r = S.get(
-            "https://www.1024tera.com/api/shorturlinfo",
-            params={"app_id": "250528", "shorturl": surl, "root": "1"},
-            timeout=20,
-        )
-        d = r.json()
-        if d.get("errno") != 0:
-            return None
-        fl = d.get("list", [])
-        if not fl:
-            return None
-        fi    = fl[0]
-        fs_id = str(fi.get("fs_id", ""))
-        fname = fi.get("server_filename", "video.mp4")
-        fsize = fi.get("size", 0)
-        uk    = str(d.get("uk", ""))
-        sid   = str(d.get("shareid", ""))
-        sign  = d.get("sign", "")
-        ts    = str(d.get("timestamp", int(time.time())))
+    if "url" in page_data:
+        return page_data  # already has direct URL
 
-        r2 = S.get(
-            "https://www.1024tera.com/api/download",
-            params={
-                "app_id": "250528", "sign": sign, "timestamp": ts,
-                "shareid": sid, "uk": uk, "product": "share",
-                "nozip": "1", "fid_list": f"[{fs_id}]",
-            },
-            timeout=20,
-        )
-        d2 = r2.json()
-        dlinks = d2.get("dlink", [])
-        if dlinks and d2.get("errno") == 0:
-            return {"filename": fname, "url": dlinks[0].get("dlink",""),
-                    "size": fsize, "referer": url}
-    except Exception as e:
-        logger.debug(f"1024tera API failed: {e}")
+    fs_id   = page_data.get("fs_id","")
+    uk      = page_data.get("uk","")
+    sid     = page_data.get("shareid","")
+    sign    = page_data.get("sign","")
+    ts      = page_data.get("timestamp",str(int(time.time())))
+    fname   = page_data.get("filename","video.mp4")
+    fsize   = page_data.get("size",0)
+    page_url= page_data.get("page_url", url)
+
+    if not fs_id or not sign:
+        dbg.err(f"M4: missing data fs_id={fs_id} sign={bool(sign)}")
+        return None
+
+    for api_base in ("https://www.terabox.com","https://www.1024terabox.com","https://www.1024tera.com"):
+        try:
+            r = S.get(
+                f"{api_base}/api/download",
+                params={
+                    "app_id":"250528","sign":sign,"timestamp":ts,
+                    "shareid":sid,"uk":uk,"product":"share",
+                    "nozip":"1","fid_list":f"[{fs_id}]",
+                },
+                headers={"Referer": page_url},
+                timeout=20,
+            )
+            d = r.json()
+            dbg.add(f"M4: download api {api_base} errno={d.get('errno')}")
+            if d.get("errno") == 0:
+                dlinks = d.get("dlink",[])
+                if dlinks:
+                    dlink = dlinks[0].get("dlink","")
+                    if dlink:
+                        dbg.ok(f"M4: got direct link for {fname}")
+                        return {"filename":fname,"url":dlink,"size":fsize,
+                                "referer": page_url}
+        except Exception as e:
+            dbg.err(f"M4: {api_base}: {e}")
     return None
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  METHOD 4: Third-party proxy APIs
+#  METHOD 5: Third-party proxy APIs
 # ─────────────────────────────────────────────────────────────────────────────
-def _api_proxies(url: str) -> dict | None:
+def _m5_proxies(url: str, dbg: DebugLog) -> dict | None:
     encoded = quote(url, safe="")
     endpoints = [
         f"https://teraboxvideodownloader.nepcoderdevs.workers.dev/?url={encoded}",
         f"https://terabox.udayscript.com/api?url={encoded}",
         f"https://ytdl.udayscript.com/terabox?url={encoded}",
         f"https://terabox-dl-api.vercel.app/api?url={encoded}",
+        f"https://terabox-video-downloader.vercel.app/api?url={encoded}",
     ]
     for ep in endpoints:
+        short = ep[:60]
         try:
+            dbg.add(f"M5: trying {short}")
             r = S.get(ep, timeout=25)
+            dbg.add(f"M5: {r.status_code}")
             if r.status_code != 200:
                 continue
             d = r.json()
-            dl = (
-                d.get("download_url") or d.get("downloadUrl") or
-                d.get("dlink") or d.get("url") or
-                (d.get("data") or {}).get("download_url") or
-                (d.get("data") or {}).get("dlink")
-            )
-            fn = (
-                d.get("file_name") or d.get("filename") or
-                d.get("title") or d.get("name") or "video.mp4"
-            )
-            sz = int(d.get("size") or d.get("file_size") or
-                     (d.get("data") or {}).get("size") or 0)
+            dl = (d.get("download_url") or d.get("downloadUrl") or
+                  d.get("dlink") or d.get("url") or
+                  (d.get("data") or {}).get("download_url") or
+                  (d.get("data") or {}).get("dlink") or
+                  (d.get("data") or {}).get("url"))
+            fn = (d.get("file_name") or d.get("filename") or
+                  d.get("title") or d.get("name") or "video.mp4")
+            sz = int(d.get("size") or d.get("file_size") or 0)
             if dl:
-                logger.info(f"Proxy resolved via: {ep[:50]}")
-                return {"filename": fn, "url": dl, "size": sz, "referer": url}
+                dbg.ok(f"M5: got link from {short}")
+                return {"filename":fn,"url":dl,"size":sz,"referer":url}
+            dbg.err(f"M5: no dl url in response: {str(d)[:150]}")
         except Exception as e:
-            logger.debug(f"Proxy {ep[:50]} failed: {e}")
+            dbg.err(f"M5: {short}: {e}")
     return None
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  METHOD 5: yt-dlp get-url only, then stream manually
+#  METHOD 6: yt-dlp get-url → stream
 # ─────────────────────────────────────────────────────────────────────────────
-def _ytdlp_get_url(url: str) -> dict | None:
-    if not _ytdlp_ok():
-        return None
+def _m6_ytdlp_url(url: str, dbg: DebugLog) -> dict | None:
+    bin_ = _ytdlp_bin()
+    if not bin_:
+        dbg.err("M6: yt-dlp not found"); return None
+    dbg.add("M6: yt-dlp --get-url")
     try:
         r = subprocess.run(
-            ["yt-dlp", "--get-url", "--no-playlist", "--quiet",
-             "--user-agent", "Mozilla/5.0 (Android 9; Mobile) Chrome/124.0", url],
+            [bin_,"--get-url","--no-playlist","--quiet",
+             "--user-agent", S.headers["User-Agent"], url],
             capture_output=True, text=True, timeout=30,
         )
+        dbg.add(f"M6: exit={r.returncode}")
         if r.returncode == 0 and r.stdout.strip():
             dl_url = r.stdout.strip().split("\n")[0]
-            # Also get title
-            r2 = subprocess.run(
-                ["yt-dlp", "--get-title", "--no-playlist", "--quiet", url],
+            # Get title
+            rt = subprocess.run(
+                [bin_,"--get-title","--no-playlist","--quiet",url],
                 capture_output=True, text=True, timeout=15,
             )
-            title = r2.stdout.strip() if r2.returncode == 0 else "video"
-            fname = _safe(title) + ".mp4"
-            return {"filename": fname, "url": dl_url, "size": 0, "referer": url}
+            title = rt.stdout.strip() if rt.returncode==0 else "video"
+            fname = _safe(title)+".mp4"
+            dbg.ok(f"M6: got URL for {fname}")
+            return {"filename":fname,"url":dl_url,"size":0,"referer":url}
+        dbg.err(f"M6: stderr={r.stderr[:200]}")
     except Exception as e:
-        logger.debug(f"yt-dlp get-url failed: {e}")
+        dbg.err(f"M6: {e}")
     return None
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  HTTP STREAM DOWNLOAD
 # ─────────────────────────────────────────────────────────────────────────────
-def _stream(info: dict, dest: str, prog=None) -> bool:
+def _stream(info: dict, dest: str, dbg: DebugLog, prog=None) -> bool:
     url  = info["url"]
-    ref  = info.get("referer", "https://www.terabox.com/")
+    ref  = info.get("referer","https://www.terabox.com/")
     hdrs = {
         "Referer": ref,
         "Accept": "*/*",
-        "Range": "bytes=0-",
+        "User-Agent": S.headers["User-Agent"],
     }
-    for attempt in range(1, DOWNLOAD_RETRIES + 1):
+    dbg.add(f"Stream: {url[:80]}")
+    for attempt in range(1, DOWNLOAD_RETRIES+1):
         try:
-            with S.get(url, stream=True, timeout=(15, 180), headers=hdrs) as r:
-                # Follow redirects (TeraBox CDN redirects)
-                if r.status_code in (301, 302, 303, 307, 308):
-                    url = r.headers.get("Location", url)
-                    continue
-                if r.status_code not in (200, 206):
-                    logger.warning(f"HTTP {r.status_code} on attempt {attempt}")
-                    time.sleep(2 * attempt)
-                    continue
-
-                total = int(r.headers.get("content-length", 0))
-                recv  = 0
-                last  = -1
-
-                if total and total > MAX_BYTES:
-                    logger.warning(f"File too large: {total} bytes")
-                    return False
-
-                with open(dest, "wb") as f:
-                    for blk in r.iter_content(chunk_size=CHUNK):
-                        if blk:
-                            f.write(blk)
-                            recv += len(blk)
-                            if recv > MAX_BYTES:
-                                logger.warning("Size limit exceeded mid-download")
-                                return False
-                            if prog and total:
-                                pct = min(int(recv * 100 / total), 99)
-                                if pct != last and pct % 10 == 0:
-                                    prog(pct, recv, total)
-                                    last = pct
-
-            sz = os.path.getsize(dest)
-            if sz < 1000:
-                logger.warning(f"Downloaded file too small: {sz} bytes")
-                os.remove(dest)
-                return False
-
-            if prog:
-                prog(100, sz, sz)
-            logger.info(f"Streamed {format_size(sz)} to {os.path.basename(dest)}")
-            return True
-
-        except Exception as e:
-            logger.warning(f"Stream attempt {attempt} failed: {e}")
-            if os.path.exists(dest):
-                os.remove(dest)
-            if attempt < DOWNLOAD_RETRIES:
-                time.sleep(3 * attempt)
-
-    return False
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  PUBLIC INTERFACE
-# ─────────────────────────────────────────────────────────────────────────────
-def download_video(url: str, user_id: int, prog=None) -> dict | None:
-    user_dir = os.path.join(DOWNLOADS_DIR, str(user_id))
-    os.makedirs(user_dir, exist_ok=True)
-
-    # Clean old partial files
-    for f in os.listdir(user_dir):
-        fp = os.path.join(user_dir, f)
-        if os.path.isfile(fp) and not f.endswith(".gz"):
-            try: os.remove(fp)
-            except OSError: pass
-
-    out_path = os.path.join(user_dir, "video.mp4")
-
-    # ── Method 1: yt-dlp direct download ─────────────────────────
-    logger.info(f"[M1] yt-dlp direct: {url}")
-    if _dl_ytdlp(url, out_path, prog):
-        if os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
-            orig = os.path.getsize(out_path)
-            # Try to get real filename from yt-dlp
-            fname = _get_ytdlp_title(url) + ".mp4"
-            final = os.path.join(user_dir, _safe(fname))
-            shutil.move(out_path, final)
-            return _finish(final, _safe(fname), orig)
-
-    # ── Method 2: TeraBox session API ────────────────────────────
-    logger.info(f"[M2] TeraBox session API: {url}")
-    info = _scrape_terabox(url)
-    if info and info.get("url"):
-        fname = _safe(info["filename"])
-        if not fname.lower().endswith((".mp4",".mkv",".webm",".mov",".avi")):
-            fname += ".mp4"
-        dest = os.path.join(user_dir, fname)
-        if info.get("size") and info["size"] > MAX_BYTES:
-            return {"error": "too_large", "size": info["size"]}
-        if _stream(info, dest, prog):
-            return _finish(dest, fname, os.path.getsize(dest))
-
-    # ── Method 3: 1024tera API ────────────────────────────────────
-    logger.info(f"[M3] 1024tera API: {url}")
-    info = _api_1024tera(url)
-    if info and info.get("url"):
-        fname = _safe(info["filename"])
-        if not fname.lower().endswith((".mp4",".mkv",".webm",".mov",".avi")):
-            fname += ".mp4"
-        dest = os.path.join(user_dir, fname)
-        if info.get("size") and info["size"] > MAX_BYTES:
-            return {"error": "too_large", "size": info["size"]}
-        if _stream(info, dest, prog):
-            return _finish(dest, fname, os.path.getsize(dest))
-
-    # ── Method 4: Proxy APIs ──────────────────────────────────────
-    logger.info(f"[M4] Proxy APIs: {url}")
-    info = _api_proxies(url)
-    if info and info.get("url"):
-        fname = _safe(info["filename"])
-        if not fname.lower().endswith((".mp4",".mkv",".webm",".mov",".avi")):
-            fname += ".mp4"
-        dest = os.path.join(user_dir, fname)
-        if _stream(info, dest, prog):
-            return _finish(dest, fname, os.path.getsize(dest))
-
-    # ── Method 5: yt-dlp get-url then stream ─────────────────────
-    logger.info(f"[M5] yt-dlp get-url + stream: {url}")
-    info = _ytdlp_get_url(url)
-    if info and info.get("url"):
-        fname = _safe(info["filename"])
-        dest  = os.path.join(user_dir, fname)
-        if _stream(info, dest, prog):
-            return _finish(dest, fname, os.path.getsize(dest))
-
-    logger.error(f"All 5 methods failed for: {url}")
-    return None
-
-def _finish(raw_path: str, filename: str, orig_size: int) -> dict:
-    gz_path = raw_path + ".gz"
-    try:
-        with open(raw_path, "rb") as fi, \
-             gzip.open(gz_path, "wb", compresslevel=1) as fo:
-            shutil.copyfileobj(fi, fo, length=2 * 1024 * 1024)
-        os.remove(raw_path)
-        comp_size = os.path.getsize(gz_path)
-        saving = (1 - comp_size/orig_size)*100 if orig_size else 0
-        logger.info(f"Compressed: {format_size(orig_size)} → {format_size(comp_size)} ({saving:.0f}% saved)")
-    except Exception as e:
-        logger.warning(f"Compression failed ({e}), using raw")
-        gz_path   = raw_path
-        comp_size = orig_size
-    return {
-        "filename":        filename,
-        "compressed_path": gz_path,
-        "original_size":   orig_size,
-        "compressed_size": comp_size,
-    }
-
-def decompress_file(gz: str) -> str:
-    if not gz.endswith(".gz"):
-        return gz
-    out = gz[:-3]
-    with gzip.open(gz, "rb") as fi, open(out, "wb") as fo:
-        shutil.copyfileobj(fi, fo, length=2 * 1024 * 1024)
-    return out
-
-def cleanup_user_dir(user_id: int):
-    shutil.rmtree(os.path.join(DOWNLOADS_DIR, str(user_id)), ignore_errors=True)
-
-def _safe(name: str) -> str:
-    name = re.sub(r'[\\/*?:"<>|\x00-\x1f]', "_", name).strip(". ")
-    return name[:180] or "video.mp4"
-
-def format_size(b: int) -> str:
-    if not b or b <= 0:
-        return "? MB"
-    for u in ("B","KB","MB","GB"):
-        if b < 1024:
-            return f"{b:.1f} {u}"
-        b /= 1024
-    return f"{b:.1f} TB"
-
-def _get_ytdlp_title(url: str) -> str:
-    try:
-        r = subprocess.run(
-            ["yt-dlp", "--get-title", "--no-playlist", "--quiet", url],
-            capture_output=True, text=True, timeout=15,
-        )
-        if r.returncode == 0 and r.stdout.strip():
-            return r.stdout.strip()[:80]
-    except Exception:
-        pass
-    return "video"
-
-def install_ytdlp() -> bool:
-    if _ytdlp_ok():
-        logger.info("yt-dlp ready ✓")
-        return True
-    logger.info(
+            with S.get(url, stream=True, timeout=(20,180), headers=hdrs,
+                       allow_redirects=True) as r:
+                dbg.add(f"Stream: HTTP {r.status_code} (attempt {attempt})")
+                if r.status_code not in (200,206):
+                    if attempt < DOWNLOAD_RETRIES:
+                        time.sleep(3*attempt)
+       
